@@ -1,50 +1,122 @@
-import sqlite3
+from flask import Flask, request, jsonify, render_template
 from twilio.rest import Client
+from twilio.base.exceptions import TwilioRestException
+from database_manager import DatabaseManager
+import os
+from dotenv import load_dotenv
+from datetime import datetime
 
-# Configuração do banco de dados
-conn = sqlite3.connect('phones.db')
-c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS phones (number TEXT)''')
-conn.commit()
+# Load environment variables
+load_dotenv()
 
-def add_phone_number(number):
-    c.execute("INSERT INTO phones (number) VALUES (?)", (number,))
-    conn.commit()
+app = Flask(__name__)
+db = DatabaseManager()
 
-def get_phone_numbers(limit):
-    c.execute("SELECT number FROM phones LIMIT ?", (limit,))
-    return [row[0] for row in c.fetchall()]
+# Twilio configuration
+TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
+TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
+TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 
-def send_sms(message, numbers):
-    # Configure as credenciais da Twilio
-    account_sid = 'your_account_sid'
-    auth_token = 'your_auth_token'
-    client = Client(account_sid, auth_token)
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-    for number in numbers:
-        client.messages.create(
-            body=message,
-            from_='+your_twilio_number',
-            to=number
-        )
+class SMSManager:
+    @staticmethod
+    def send_bulk_sms(message, recipient_count):
+        db.connect()
+        try:
+            phones = db.get_active_phones(limit=recipient_count)
+            successful = 0
+            failed = 0
+            
+            for phone_id, number in phones:
+                try:
+                    message_obj = twilio_client.messages.create(
+                        body=message,
+                        from_=TWILIO_PHONE_NUMBER,
+                        to=number
+                    )
+                    
+                    # Log successful message
+                    db.add_message_history(
+                        phone_id=phone_id,
+                        message=message,
+                        status='sent'
+                    )
+                    successful += 1
+                    
+                except TwilioRestException as e:
+                    # Log failed message
+                    db.add_message_history(
+                        phone_id=phone_id,
+                        message=message,
+                        status=f'failed: {str(e)}'
+                    )
+                    failed += 1
+                    
+            return {
+                'success': True,
+                'successful': successful,
+                'failed': failed,
+                'total': len(phones)
+            }
+            
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e)
+            }
+        finally:
+            db.disconnect()
 
-def main():
-    print("Bem-vindo ao sistema de envio de SMS!")
+# Routes
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/api/send-sms', methods=['POST'])
+def send_sms():
+    data = request.json
+    if not data or 'message' not in data or 'recipients' not in data:
+        return jsonify({
+            'success': False,
+            'error': 'Missing required fields'
+        }), 400
+        
+    result = SMSManager.send_bulk_sms(
+        message=data['message'],
+        recipient_count=int(data['recipients'])
+    )
     
-    message = input("Digite a mensagem que deseja enviar: ")
-    print("Quantos números você deseja enviar a mensagem?")
-    print("1. 1000")
-    print("2. 5000")
-    print("3. 10000")
-    print("4. 20000")
+    return jsonify(result)
 
-    choice = int(input("Escolha uma opção (1-4): "))
-    limits = {1: 1000, 2: 5000, 3: 10000, 4: 20000}
-    limit = limits.get(choice, 1000)
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    db.connect()
+    try:
+        total_phones = len(db.get_active_phones())
+        history = db.get_message_history()
+        
+        stats = {
+            'total_phones': total_phones,
+            'total_messages_sent': len(history),
+            'last_message_sent': history[-1][2] if history else None
+        }
+        return jsonify(stats)
+    finally:
+        db.disconnect()
 
-    numbers = get_phone_numbers(limit)
-    send_sms(message, numbers)
-    print(f"Mensagem enviada para {len(numbers)} números.")
+@app.errorhandler(Exception)
+def handle_error(error):
+    return jsonify({
+        'success': False,
+        'error': str(error)
+    }), 500
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    # Ensure database is initialized
+    db.connect()
+    db.create_tables()
+    db.disconnect()
+    
+    # Run Flask app
+    app.run(debug=True)
